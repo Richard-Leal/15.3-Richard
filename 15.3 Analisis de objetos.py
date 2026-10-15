@@ -28,7 +28,7 @@ STYLE_BTN = {"font": FONT_BOLD, "relief": "flat", "cursor": "hand2"}
 imageToShow = None      # Imagen BGR original cargada/capturada
 Captura = None
 capture = None
-camara_activa = False   # Indica si la cámara está activa
+camara_activa = False
 valor = 0               # 0: Archivo, 2: Cámara
 recorte_activo = None   # Matriz OpenCV escala de grises recortada
 historial_recortes = [] # Pila para deshacer recortes (Z)
@@ -40,7 +40,7 @@ rect_id = None
 offset_x, offset_y = 0, 0
 
 ventana = tk.Tk()
-ventana.geometry("1320x740")
+ventana.geometry("1320x760")
 ventana.title("Detector de Objetos Integrado - Paso 15.3")
 ventana.configure(bg=BG)
 ventana.resizable(False, False)
@@ -133,7 +133,7 @@ def camara():
     if not camara_activa:
         cam_found = False
         for idx in (0, 1, 2):
-            cap_try = cv2.VideoCapture(0, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(idx)
+            cap_try = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(idx)
             if not cap_try.isOpened():
                 cap_try = cv2.VideoCapture(idx)
             
@@ -258,7 +258,6 @@ def al_soltar_click(event):
         aplicar_recorte()
 
 def al_presionar_tecla(event):
-    # Si el usuario está escribiendo dentro de la caja de nombre, ignorar atajos del teclado
     if ventana.focus_get() == EntradaNombre:
         return
 
@@ -271,6 +270,8 @@ def al_presionar_tecla(event):
         Capturar()
     elif key in ('c', 'c'):
         camara()
+    elif key in ('o', 'o'):
+        comparar_todo()
     elif key == 'up':
         SGray.set(min(255, SGray.get() + 1))
     elif key == 'down':
@@ -282,17 +283,37 @@ def al_presionar_tecla(event):
 
 ventana.bind("<Key>", al_presionar_tecla)
 
-def umbralizar(val=None):
+def obtener_recorte_o_base():
     global recorte_activo
-    if recorte_activo is None:
+    if recorte_activo is not None:
+        return recorte_activo
+    base = imagenBase()
+    if base is not None:
+        return cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+    return None
+
+def umbralizar(val=None):
+    src = obtener_recorte_o_base()
+    if src is None:
         return None
     
-    mostrar(LImagen2, recorte_activo)
-    umb = int(SGray.get())
-    binaria = cv2.inRange(recorte_activo, umb, 255)
-    mostrar(LImagenUmbral, binaria)
+    mostrar(LImagen2, src)
     
-    comparar_todo()
+    if var_adaptativo.get():
+        blur = cv2.GaussianBlur(src, (5, 5), 0)
+        binaria = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
+    else:
+        umb = int(SGray.get())
+        if var_invertir.get():
+            binaria = cv2.inRange(src, 0, umb)
+        else:
+            binaria = cv2.inRange(src, umb, 255)
+        
+    if var_morfo.get():
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        binaria = cv2.morphologyEx(binaria, cv2.MORPH_CLOSE, kernel)
+
+    mostrar(LImagenUmbral, binaria)
     return binaria
 
 def Guardar_patron():
@@ -352,18 +373,33 @@ def comparar_todo():
     global patron_seleccionado
     base = imagenBase()
     if base is None:
+        messagebox.showwarning("Aviso", "Primero carga una imagen o toma una foto con la cámara.")
         return
     archivos = [f for f in os.listdir(CARPETA_PATRONES) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
     if not archivos:
+        messagebox.showwarning("Aviso", "No hay patrones guardados en la carpeta para comparar.")
         actualizar_treeview(TablaTemplate, [])
         actualizar_treeview(TablaShapes, [])
         actualizar_treeview(TablaHu, [])
         return
 
-    umb = int(SGray.get())
     paso = max(1, int(SAngulo.get()))
+    src = obtener_recorte_o_base()
     
-    img_bin = cv2.inRange(recorte_activo, umb, 255) if recorte_activo is not None else cv2.inRange(cv2.cvtColor(base, cv2.COLOR_BGR2GRAY), umb, 255)
+    if var_adaptativo.get():
+        blur = cv2.GaussianBlur(src, (5, 5), 0)
+        img_bin = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
+    else:
+        umb = int(SGray.get())
+        if var_invertir.get():
+            img_bin = cv2.inRange(src, 0, umb)
+        else:
+            img_bin = cv2.inRange(src, umb, 255)
+        
+    if var_morfo.get():
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        img_bin = cv2.morphologyEx(img_bin, cv2.MORPH_CLOSE, kernel)
+        
     ih, iw = img_bin.shape[:2]
     
     cnt_actual = contorno_mayor(img_bin)
@@ -371,7 +407,8 @@ def comparar_todo():
     
     res_tm, res_shapes, res_hu = [], [], []
     mejor_tm_val = -1.0
-    mejor_tm_img = None
+    patron_ganador_img = None
+    escena_con_cuadro = None
     info_patron_activo = ""
 
     if not patron_seleccionado and archivos:
@@ -387,36 +424,41 @@ def comparar_todo():
         es_el_seleccionado = (nombre.strip().lower() == str(patron_seleccionado).strip().lower())
         
         best_v, best_tmpl, best_loc = -1.0, None, (0, 0)
-        if es_el_seleccionado or len(archivos) <= 3:
-            for angulo in range(0, 360, paso):
-                rot = rotar_template(patron, angulo)
-                th, tw = rot.shape[:2]
-                if th > ih or tw > iw:
+        
+        for angulo in range(0, 360, paso):
+            rot = rotar_template(patron, angulo)
+            th, tw = rot.shape[:2]
+            
+            if th > ih or tw > iw:
+                scale = min(ih / th, iw / tw) * 0.95
+                if scale > 0:
+                    rot = cv2.resize(rot, (max(1, int(tw * scale)), max(1, int(th * scale))), interpolation=cv2.INTER_NEAREST)
+                    th, tw = rot.shape[:2]
+                else:
                     continue
-                for t in (rot, cv2.bitwise_not(rot)):
-                    r = cv2.matchTemplate(img_bin, t, cv2.TM_CCOEFF_NORMED)
-                    _, v, _, loc = cv2.minMaxLoc(r)
-                    if v > best_v:
-                        best_v, best_tmpl, best_loc = v, t, loc
-        else:
-            th, tw = patron.shape[:2]
-            if th <= ih and tw <= iw:
-                r = cv2.matchTemplate(img_bin, patron, cv2.TM_CCOEFF_NORMED)
-                _, best_v, _, best_loc = cv2.minMaxLoc(r)
-                best_tmpl = patron
+
+            r = cv2.matchTemplate(img_bin, rot, cv2.TM_CCOEFF_NORMED)
+            _, v, _, loc = cv2.minMaxLoc(r)
+            if v > best_v:
+                best_v, best_tmpl, best_loc = v, rot, loc
 
         sim = best_v * 100 if best_v >= 0 else 0.0
         res_tm.append((nombre, f"{sim:.2f}%"))
         
-        if es_el_seleccionado or (mejor_tm_img is None and best_v > mejor_tm_val):
+        if es_el_seleccionado or (escena_con_cuadro is None and best_v > mejor_tm_val):
             if best_tmpl is not None:
                 mejor_tm_val = best_v
                 th2, tw2 = best_tmpl.shape[:2]
                 mx, my = best_loc
+                
+                # Cuadro 3: Escena umbralizada con rectángulo amarillo
                 vis = cv2.cvtColor(img_bin, cv2.COLOR_GRAY2RGB)
                 cv2.rectangle(vis, (mx, my), (mx + tw2, my + th2), (255, 220, 0), 2)
-                mejor_tm_img = vis
-                info_patron_activo = f"🎯 Evaluando: {nombre}\nSimilitud: {sim:.2f}%"
+                escena_con_cuadro = vis
+                
+                # Cuadro 4: Muestra la plantilla pura almacenada
+                patron_ganador_img = patron.copy()
+                info_patron_activo = f"🎯 Coincidencia: {nombre}\nSimilitud: {sim:.2f}%"
             
         cnt_p = contorno_mayor(patron)
         score = cv2.matchShapes(cnt_actual, cnt_p, cv2.CONTOURS_MATCH_I2, 0) if cnt_actual is not None and cnt_p is not None else float("inf")
@@ -431,8 +473,10 @@ def comparar_todo():
     res_shapes.sort(key=lambda x: float(x[1]) if x[1] != "N/A" else 9999)
     res_hu.sort(key=lambda x: float(x[1]) if x[1] != "N/A" else 9999)
 
-    if mejor_tm_img is not None:
-        mostrar(LImagenResultado, mejor_tm_img, w=280, h=210)
+    if escena_con_cuadro is not None:
+        mostrar(LImagenUmbral, escena_con_cuadro, w=280, h=210) # Rectángulo en la escena
+    if patron_ganador_img is not None:
+        mostrar(LImagenResultado, patron_ganador_img, w=280, h=210) # Template base limpia
         lbl_info.configure(text=info_patron_activo, fg=BLUE)
 
     actualizar_treeview(TablaTemplate, res_tm)
@@ -452,6 +496,10 @@ grid_container.pack(expand=True, fill="both", padx=16, pady=12)
 grid_container.columnconfigure((0, 1, 2, 3), weight=1, uniform="col")
 grid_container.rowconfigure(0, weight=0)
 grid_container.rowconfigure(1, weight=1)
+
+var_invertir = tk.BooleanVar(value=True)
+var_morfo = tk.BooleanVar(value=True)
+var_adaptativo = tk.BooleanVar(value=False)
 
 for i in range(4):
     card = tk.Frame(grid_container, bg=PANEL, highlightthickness=1, highlightbackground=ACCENT)
@@ -494,13 +542,17 @@ for i in range(4):
         LImagen2 = tk.Label(FCont, bg=BG)
         LImagen2.pack(expand=True, fill="both")
         
-        SGray = tk.Scale(card, from_=0, to=255, resolution=1, orient="horizontal", label="Umbral Gris (▲/▼)", bg=PANEL, fg=FG, troughcolor=ACCENT, highlightthickness=0, command=umbralizar, takefocus=1)
-        SGray.set(127)
-        SGray.pack(fill="x", padx=8, pady=2)
+        SGray = tk.Scale(card, from_=0, to=255, resolution=1, orient="horizontal", label="Umbral Gris (▲/▼)", bg=PANEL, fg=FG, troughcolor=ACCENT, highlightthickness=0, command=lambda v: umbralizar(), takefocus=1)
+        SGray.set(130)
+        SGray.pack(fill="x", padx=8, pady=1)
         
-        SAngulo = tk.Scale(card, from_=1, to=90, orient="horizontal", label="Paso Angular (◄/►)", bg=PANEL, fg=FG, troughcolor=ACCENT, highlightthickness=0, command=umbralizar, takefocus=1)
+        SAngulo = tk.Scale(card, from_=1, to=90, orient="horizontal", label="Paso Angular (◄/►)", bg=PANEL, fg=FG, troughcolor=ACCENT, highlightthickness=0, command=lambda v: umbralizar(), takefocus=1)
         SAngulo.set(5)
-        SAngulo.pack(fill="x", padx=8, pady=(0, 6))
+        SAngulo.pack(fill="x", padx=8, pady=1)
+
+        tk.Checkbutton(card, text="Invertir Umbral (Mesa clara / Madera)", variable=var_invertir, command=lambda: umbralizar(), bg=PANEL, fg=FG, selectcolor=BG, activebackground=PANEL, activeforeground=FG, font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=1)
+        tk.Checkbutton(card, text="Unir Silueta (Morfológica)", variable=var_morfo, command=lambda: umbralizar(), bg=PANEL, fg=FG, selectcolor=BG, activebackground=PANEL, activeforeground=FG, font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=1)
+        tk.Checkbutton(card, text="Modo Adaptativo (Auto Sombras)", variable=var_adaptativo, command=lambda: umbralizar(), bg=PANEL, fg=FG, selectcolor=BG, activebackground=PANEL, activeforeground=FG, font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(0, 4))
 
     elif i == 2:
         tk.Label(card, text="3. Imagen Umbralizada", bg=PANEL, fg=FG, font=FONT_TITLE).pack(pady=(8, 4))
@@ -512,13 +564,17 @@ for i in range(4):
         LImagenUmbral.pack(expand=True, fill="both")
         
         FNombre = tk.Frame(card, bg=PANEL)
-        FNombre.pack(fill="x", padx=8, pady=5)
+        FNombre.pack(fill="x", padx=8, pady=2)
         tk.Label(FNombre, text="Nombre:", bg=PANEL, fg=FG, font=FONT_BOLD).pack(side="left")
         EntradaNombre = tk.Entry(FNombre, bg=BG, fg=FG, font=FONT, insertbackground=FG, relief="flat")
         EntradaNombre.insert(0, "patron")
         EntradaNombre.pack(side="left", fill="x", expand=True, padx=(5, 0))
         
-        tk.Button(card, text="Guardar Patrón", command=Guardar_patron, bg=GREEN, fg="#11111b", **STYLE_BTN).pack(fill="x", padx=8, pady=(0, 6))
+        FBotAcciones = tk.Frame(card, bg=PANEL)
+        FBotAcciones.pack(fill="x", padx=8, pady=(2, 6))
+        
+        tk.Button(FBotAcciones, text="Guardar Patrón", command=Guardar_patron, bg=GREEN, fg="#11111b", **STYLE_BTN).pack(fill="x", pady=2)
+        tk.Button(FBotAcciones, text="Comparar todo (O)", command=comparar_todo, bg=BLUE, fg="#11111b", **STYLE_BTN).pack(fill="x", pady=2)
 
     elif i == 3:
         tk.Label(card, text="4. Mejor Coincidencia", bg=PANEL, fg=FG, font=FONT_TITLE).pack(pady=(8, 4))
@@ -529,7 +585,7 @@ for i in range(4):
         LImagenResultado = tk.Label(FCont, bg=BG)
         LImagenResultado.pack(expand=True, fill="both")
         
-        lbl_info = tk.Label(card, text="Haz clic en cualquier patrón de la tabla\npara compararlo en tiempo real", bg=PANEL, fg=BLUE, font=("Segoe UI", 9, "bold"))
+        lbl_info = tk.Label(card, text="Presiona 'Comparar todo (O)' o haz clic\nen la tabla para evaluar patrones", bg=PANEL, fg=BLUE, font=("Segoe UI", 8, "italic"))
         lbl_info.pack(fill="both", expand=True, padx=8, pady=8)
 
 for j in range(3):
