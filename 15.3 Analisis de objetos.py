@@ -39,6 +39,10 @@ end_x, end_y = None, None
 rect_id = None
 offset_x, offset_y = 0, 0
 
+# Variables para seguimiento en tiempo real
+modo_tiempo_real = False
+prev_cx, prev_cy = None, None
+
 ventana = tk.Tk()
 ventana.geometry("1320x760")
 ventana.title("Detector de Objetos Integrado - Paso 15.3")
@@ -82,10 +86,11 @@ def mostrar_imagen_original():
         LImagen.image = tk_img
 
 def archivo():
-    global imageToShow, valor, recorte_activo, historial_recortes, camara_activa
+    global imageToShow, valor, recorte_activo, historial_recortes, camara_activa, modo_tiempo_real
     if camara_activa:
         camara()
         
+    modo_tiempo_real = False
     path = filedialog.askopenfilename(filetypes=[("Archivos de imagen", "*.jpg *.jpeg *.png *.bmp")])
     if not path:
         return
@@ -105,6 +110,62 @@ def archivo():
     valor = 0
     mostrar_imagen_original()
     umbralizar()
+
+def procesar_frame_tiempo_real(frame):
+    global prev_cx, prev_cy
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    if var_adaptativo.get():
+        binaria = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
+    else:
+        umb = int(SGray.get())
+        if var_invertir.get():
+            binaria = cv2.inRange(gray, 0, umb)
+        else:
+            binaria = cv2.inRange(gray, umb, 255)
+            
+    if var_morfo.get():
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        binaria = cv2.morphologyEx(binaria, cv2.MORPH_CLOSE, kernel)
+
+    frame_anotado = frame.copy()
+    cnts, _ = cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    info_mov = "Sin objetos detectados"
+    
+    for cnt in cnts:
+        if cv2.contourArea(cnt) > 800:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+            else:
+                cx, cy = 0, 0
+
+            x, y, bw, bh = cv2.boundingRect(cnt)
+
+            estado = "Quieto"
+            if prev_cx is not None and prev_cy is not None:
+                dist = np.sqrt((cx - prev_cx)**2 + (cy - prev_cy)**2)
+                if dist > 3.0:
+                    estado = "En Movimiento"
+
+            prev_cx, prev_cy = cx, cy
+
+            color = (0, 255, 0) if estado == "Quieto" else (0, 0, 255)
+            cv2.rectangle(frame_anotado, (x, y), (x + bw, y + bh), color, 2)
+            cv2.circle(frame_anotado, (cx, cy), 4, (255, 220, 0), -1)
+
+            cv2.putText(frame_anotado, f"({cx}, {cy})", (x, max(15, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            cv2.putText(frame_anotado, estado, (x, max(30, y + bh + 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
+
+            info_mov = f"📍 Posición X:{cx} Y:{cy} px\n⚡ Estado: {estado}"
+
+    mostrar(LImagenUmbral, binaria)
+    mostrar(LImagenResultado, frame_anotado, bgr=True)
+    lbl_info.configure(text=info_mov, fg=BLUE)
 
 def iniciar():
     if not camara_activa or capture is None:
@@ -126,6 +187,9 @@ def iniciar():
         LImagen.create_image(off_x, off_y, anchor=tk.NW, image=tk_img)
         LImagen.image = tk_img
         
+        if modo_tiempo_real:
+            procesar_frame_tiempo_real(frame_resized)
+            
         LImagen.after(30, iniciar)
 
 def camara():
@@ -163,8 +227,19 @@ def camara():
             BCamara.configure(text="Cámara (C)")
         LImagen.delete("all")
 
+def toggle_tiempo_real():
+    global modo_tiempo_real
+    if not camara_activa:
+        camara()
+    
+    modo_tiempo_real = not modo_tiempo_real
+    if modo_tiempo_real:
+        BTiempoReal.configure(text="T. Real: ON", bg=GREEN)
+    else:
+        BTiempoReal.configure(text="T. Real: OFF", bg=ACCENT)
+
 def Capturar():
-    global valor, Captura, recorte_activo, historial_recortes
+    global valor, Captura, recorte_activo, historial_recortes, modo_tiempo_real
     if capture is None or not capture.isOpened():
         messagebox.showwarning("Aviso", "Primero debes activar la cámara web (Cámara).")
         return
@@ -172,6 +247,11 @@ def Capturar():
     if not ret:
         messagebox.showerror("Error", "No se pudo obtener el fotograma de la cámara")
         return
+    
+    modo_tiempo_real = False
+    if 'BTiempoReal' in globals():
+        BTiempoReal.configure(text="T. Real: OFF", bg=ACCENT)
+
     h_f, w_f = frame.shape[:2]
     prop = min(280 / w_f, 210 / h_f)
     new_w, new_h = max(1, int(w_f * prop)), max(1, int(h_f * prop))
@@ -187,11 +267,15 @@ def Capturar():
     umbralizar()
 
 def aplicar_recorte():
-    global recorte_activo, start_x, start_y, end_x, end_y, rect_id
+    global recorte_activo, start_x, start_y, end_x, end_y, rect_id, modo_tiempo_real
     base = imagenBase()
     if base is None or start_x is None or end_x is None:
         return
     
+    modo_tiempo_real = False
+    if 'BTiempoReal' in globals():
+        BTiempoReal.configure(text="T. Real: OFF", bg=ACCENT)
+
     h_img, w_img = base.shape[:2]
     x1_c, x2_c = min(start_x, end_x), max(start_x, end_x)
     y1_c, y2_c = min(start_y, end_y), max(start_y, end_y)
@@ -293,6 +377,9 @@ def obtener_recorte_o_base():
     return None
 
 def umbralizar(val=None):
+    if modo_tiempo_real:
+        return None
+
     src = obtener_recorte_o_base()
     if src is None:
         return None
@@ -370,7 +457,11 @@ def al_seleccionar_patron(event):
         comparar_todo()
 
 def comparar_todo():
-    global patron_seleccionado
+    global patron_seleccionado, modo_tiempo_real
+    modo_tiempo_real = False
+    if 'BTiempoReal' in globals():
+        BTiempoReal.configure(text="T. Real: OFF", bg=ACCENT)
+
     base = imagenBase()
     if base is None:
         messagebox.showwarning("Aviso", "Primero carga una imagen o toma una foto con la cámara.")
@@ -474,9 +565,9 @@ def comparar_todo():
     res_hu.sort(key=lambda x: float(x[1]) if x[1] != "N/A" else 9999)
 
     if escena_con_cuadro is not None:
-        mostrar(LImagenUmbral, escena_con_cuadro, w=280, h=210) # Rectángulo en la escena
+        mostrar(LImagenUmbral, escena_con_cuadro, w=280, h=210)
     if patron_ganador_img is not None:
-        mostrar(LImagenResultado, patron_ganador_img, w=280, h=210) # Template base limpia
+        mostrar(LImagenResultado, patron_ganador_img, w=280, h=210)
         lbl_info.configure(text=info_patron_activo, fg=BLUE)
 
     actualizar_treeview(TablaTemplate, res_tm)
@@ -573,8 +664,12 @@ for i in range(4):
         FBotAcciones = tk.Frame(card, bg=PANEL)
         FBotAcciones.pack(fill="x", padx=8, pady=(2, 6))
         
-        tk.Button(FBotAcciones, text="Guardar Patrón", command=Guardar_patron, bg=GREEN, fg="#11111b", **STYLE_BTN).pack(fill="x", pady=2)
-        tk.Button(FBotAcciones, text="Comparar todo (O)", command=comparar_todo, bg=BLUE, fg="#11111b", **STYLE_BTN).pack(fill="x", pady=2)
+        tk.Button(FBotAcciones, text="Guardar Patrón", command=Guardar_patron, bg=GREEN, fg="#11111b", **STYLE_BTN).pack(fill="x", pady=1)
+        tk.Button(FBotAcciones, text="Comparar todo (O)", command=comparar_todo, bg=BLUE, fg="#11111b", **STYLE_BTN).pack(fill="x", pady=1)
+        
+        # Botón para activar/desactivar Seguimiento en Tiempo Real
+        BTiempoReal = tk.Button(FBotAcciones, text="T. Real: OFF", command=toggle_tiempo_real, bg=ACCENT, fg=FG, **STYLE_BTN)
+        BTiempoReal.pack(fill="x", pady=1)
 
     elif i == 3:
         tk.Label(card, text="4. Mejor Coincidencia", bg=PANEL, fg=FG, font=FONT_TITLE).pack(pady=(8, 4))
@@ -585,7 +680,7 @@ for i in range(4):
         LImagenResultado = tk.Label(FCont, bg=BG)
         LImagenResultado.pack(expand=True, fill="both")
         
-        lbl_info = tk.Label(card, text="Presiona 'Comparar todo (O)' o haz clic\nen la tabla para evaluar patrones", bg=PANEL, fg=BLUE, font=("Segoe UI", 8, "italic"))
+        lbl_info = tk.Label(card, text="Presiona 'Comparar todo (O)' o activa\n'T. Real' para coordenadas en vivo", bg=PANEL, fg=BLUE, font=("Segoe UI", 8, "italic"))
         lbl_info.pack(fill="both", expand=True, padx=8, pady=8)
 
 for j in range(3):
